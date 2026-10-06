@@ -15,6 +15,9 @@ pub struct Manifest {
     pub cli_version: String,
     pub bridge_sha256: String,
     pub icon: Option<String>,
+    /// Whether the wrapper turns on the bridge's debug log.
+    #[serde(default)]
+    pub debug: bool,
     pub targets: Vec<Entry>,
 }
 

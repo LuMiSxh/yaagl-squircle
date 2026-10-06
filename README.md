@@ -22,11 +22,19 @@ yaagl-squircle uninstall
 
 Quit the game and YAAGL first. A Wine update inside YAAGL wipes the patch; `status` then shows `wiped`, and `apply` restores it.
 
-`apply --icon my.png` uses your own PNG instead of the clipped game icon. `--target <name|path>` selects a specific install; by default every `~/Library/Application Support/*/wine/bin` is patched.
+`apply --icon my.png` uses your own PNG instead of the clipped game icon. `--target <name|path>` selects a specific install.
+
+Only YAAGL installs are touched: a folder counts only if it has `wine/bin`, `wine/lib/wine` and YAAGL's `resources.neu`. Wine installs of other launchers are ignored, even with `--target`.
 
 ## Something does not work
 
-Run `yaagl-squircle status --verbose` and include its output in an issue. If `apply` fails, it restores the original loader and prints a `hint:` line; include that too.
+```sh
+yaagl-squircle debug on     # then start the game once, then quit it
+yaagl-squircle debug        # shows the log's last lines; the file is in the data folder
+yaagl-squircle debug off
+```
+
+Include the output of `yaagl-squircle status --verbose` and `yaagl-squircle debug` in an issue. If `apply` fails, it restores the original loader and prints a `hint:` line; include that too.
 
 ## Build
 

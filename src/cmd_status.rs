@@ -83,8 +83,17 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
     }
 
     out.emit(
-        || render(&rows),
-        json!({"bridge_embedded": !BRIDGE.is_empty(), "targets": rows}),
+        || {
+            let mut s = render(&rows);
+            if manifest.debug {
+                s.push_str(&format!(
+                    "\ndebug: on, log {}",
+                    cmd_apply::log_path(&data).display()
+                ));
+            }
+            s
+        },
+        json!({"bridge_embedded": !BRIDGE.is_empty(), "debug": manifest.debug, "targets": rows}),
     );
     Ok(if all_ok {
         Outcome::Done

@@ -17,9 +17,12 @@ pub struct Target {
 }
 
 impl Target {
-    /// Accepts a `wine/bin` folder that has a loader (original or renamed) and `lib/wine`.
+    /// Accepts a `wine/bin` folder that has a loader (original or renamed) and `lib/wine`,
+    /// and only inside a YAAGL data folder. `resources.neu` is the Neutralino bundle that
+    /// YAAGL's launcher copies there; Wine installs of other launchers lack it and are
+    /// never touched.
     pub fn from_bin(bin: &Path) -> Option<Self> {
-        if !bin.join("../lib/wine").is_dir() {
+        if !bin.join("../lib/wine").is_dir() || !bin.join("../../resources.neu").is_file() {
             return None;
         }
         ["wine64", "wine"]

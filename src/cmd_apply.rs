@@ -61,6 +61,20 @@ enum Undo {
     Restore(Vec<u8>),
 }
 
+pub fn log_path(data: &Path) -> PathBuf {
+    data.join("bridge.log")
+}
+
+/// Arguments that re-apply exactly the given folders, for commands that change the wrapper.
+pub fn refresh_args(targets: Vec<String>) -> Args {
+    Args {
+        targets,
+        icon: None,
+        dry_run: false,
+        force: false,
+    }
+}
+
 pub fn bridge_path(data: &Path) -> PathBuf {
     data.join(BRIDGE_FILE)
 }
@@ -92,9 +106,15 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
         .map(|_| data.join(ICON_FILE))
         .or_else(|| manifest.icon.as_ref().map(PathBuf::from));
 
+    let log_path = manifest.debug.then(|| log_path(&data));
     let mut plans = Vec::new();
     for t in &found {
-        let expected = wrapper::render(t.loader, &bridge_path, icon_path.as_deref());
+        let expected = wrapper::render(
+            t.loader,
+            &bridge_path,
+            icon_path.as_deref(),
+            log_path.as_deref(),
+        );
         let mut plan = plan_for(t, &expected, bridge_ok && icon_src.is_none(), args.force)?;
         if plan == Plan::Current && args.force {
             plan = Plan::Refresh;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod cmd_apply;
+mod cmd_debug;
 mod cmd_revert;
 mod cmd_status;
 mod cmd_uninstall;
@@ -41,6 +42,8 @@ enum Cmd {
     Apply(cmd_apply::Args),
     /// Show what is patched, what drifted, and whether the bridge loads.
     Status(cmd_status::Args),
+    /// Turn the bridge's debug log on or off, or show it.
+    Debug(cmd_debug::Args),
     /// Restore the original Wine loader(s); keeps our data folder.
     Revert(cmd_revert::Args),
     /// Update this CLI from GitHub releases, then refresh existing patches.
@@ -56,6 +59,7 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Apply(a) => cmd_apply::run(a, &out),
         Cmd::Status(a) => cmd_status::run(a, &out),
+        Cmd::Debug(a) => cmd_debug::run(a, &out),
         Cmd::Revert(a) => cmd_revert::run(a, &out),
         #[cfg(feature = "cmd-update")]
         Cmd::Update(a) => cmd_update::run(a, &out),

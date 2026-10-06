@@ -31,6 +31,7 @@ impl Env {
         let bin = dir.path().join("Yaagl/wine/bin");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(dir.path().join("Yaagl/wine/lib/wine")).unwrap();
+        fs::write(dir.path().join("Yaagl/resources.neu"), "").unwrap();
         match loader {
             Loader::Script => {
                 fs::write(bin.join("wine64"), SCRIPT_WINE).unwrap();
@@ -109,6 +110,24 @@ fn status_reports_not_patched_and_json() {
     assert_eq!(v["targets"][0]["state"], "not patched");
 }
 
+#[test]
+fn wine_folders_without_yaagl_marker_are_never_touched() {
+    let env = Env::new(Loader::Script);
+    let other = env.dir.path().join("OtherLauncher/wine/bin");
+    fs::create_dir_all(&other).unwrap();
+    fs::create_dir_all(env.dir.path().join("OtherLauncher/wine/lib/wine")).unwrap();
+    fs::write(other.join("wine64"), SCRIPT_WINE).unwrap();
+
+    let status = env.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(v["targets"].as_array().unwrap().len(), 1);
+
+    let o = env.run(&["apply", "--dry-run", "--target", "OtherLauncher"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("hint:"));
+    assert_eq!(read(&other.join("wine64")), SCRIPT_WINE.as_bytes());
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn apply_without_bridge_explains_itself() {
@@ -121,6 +140,38 @@ fn apply_without_bridge_explains_itself() {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+
+    #[test]
+    fn debug_toggle_rewrites_the_wrapper_and_the_bridge_logs() {
+        let env = Env::new(Loader::Binary);
+        assert_eq!(code(&env.run(&["apply"])), 0);
+        let wrapper = || String::from_utf8(read(&env.bin().join("wine64"))).unwrap();
+        assert!(!wrapper().contains("YAAGL_SQUIRCLE_DEBUG"));
+
+        let on = env.run(&["debug", "on"]);
+        assert_eq!(code(&on), 0, "{}", stderr(&on));
+        assert!(wrapper().contains("YAAGL_SQUIRCLE_LOG"));
+        assert_eq!(code(&env.run(&["debug", "on"])), 1);
+        assert_eq!(code(&env.run(&["status"])), 0);
+
+        let run = Command::new(env.bin().join("wine64"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(run.status.success());
+        let log = fs::read_to_string(env.data().join("bridge.log")).unwrap();
+        assert!(log.contains("bridge loaded in wine64.real"), "{log}");
+        let shown = stdout(&env.run(&["debug"]));
+        assert!(
+            shown.contains("debug: on") && shown.contains("bridge loaded"),
+            "{shown}"
+        );
+
+        let off = env.run(&["debug", "off"]);
+        assert_eq!(code(&off), 0, "{}", stderr(&off));
+        assert!(!wrapper().contains("YAAGL_SQUIRCLE_DEBUG"));
+        assert_eq!(code(&env.run(&["debug", "off"])), 1);
+    }
 
     #[test]
     fn dry_run_changes_nothing() {

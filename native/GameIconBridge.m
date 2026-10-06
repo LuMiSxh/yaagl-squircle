@@ -3,10 +3,12 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,6 +75,27 @@ static pthread_mutex_t icon_setter_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *custom_game_icon_path;
 static id custom_game_icon;
 static bool debug_enabled;
+static char *debug_log_path;
+
+/* Debug output goes to stderr and, when the wrapper set YAAGL_SQUIRCLE_LOG, is appended to
+ * that file with a timestamp and pid. The stderr line carries the "bridge loaded" marker
+ * that the CLI's smoke test looks for, so it must stay even when a log file is set. */
+static void debug_log(const char *format, ...) {
+	if (!debug_enabled) return;
+
+	char line[512];
+	va_list arguments;
+	va_start(arguments, format);
+	vsnprintf(line, sizeof line, format, arguments);
+	va_end(arguments);
+
+	fprintf(stderr, "yaagl-squircle: %s\n", line);
+	if (debug_log_path == NULL) return;
+	FILE *file = fopen(debug_log_path, "a");
+	if (file == NULL) return;
+	fprintf(file, "%ld pid=%d %s\n", (long)time(NULL), (int)getpid(), line);
+	fclose(file);
+}
 
 /* Typed objc_msgSend adapters are required because the runtime declares objc_msgSend
  * without the concrete return and argument ABI of each selector. Keep these signatures
@@ -138,12 +161,18 @@ static id normalized_game_icon(id source) {
 
 	Class image_class = objc_getClass("NSImage");
 	Class graphics_context_class = objc_getClass("NSGraphicsContext");
-	if (image_class == Nil || graphics_context_class == Nil) return source;
+	if (image_class == Nil || graphics_context_class == Nil) {
+		debug_log("NSImage/NSGraphicsContext missing; icon left unchanged");
+		return source;
+	}
 
 	AKSize canvas_size = { icon_canvas_dimension, icon_canvas_dimension };
 	id result = send_id((id)image_class, sel_registerName("alloc"));
 	result = send_id_with_size(result, sel_registerName("initWithSize:"), canvas_size);
-	if (result == nil) return source;
+	if (result == nil) {
+		debug_log("could not create the canvas image; icon left unchanged");
+		return source;
+	}
 
 	send_void(result, sel_registerName("lockFocus"));
 	id context = send_id((id)graphics_context_class, sel_registerName("currentContext"));
@@ -163,7 +192,14 @@ static id normalized_game_icon(id source) {
 			destination,
 			icon_corner_radius,
 			icon_corner_radius);
-		if (path != nil) send_void(path, sel_registerName("addClip"));
+		if (path != nil) {
+			send_void(path, sel_registerName("addClip"));
+			debug_log("squircle clip applied");
+		} else {
+			debug_log("NSBezierPath returned nil; icon drawn without rounded corners");
+		}
+	} else {
+		debug_log("NSBezierPath missing; icon drawn without rounded corners");
 	}
 
 	AKRect source_rect = { { 0.0, 0.0 }, send_size(source, sel_registerName("size")) };
@@ -186,8 +222,13 @@ static id normalized_game_icon(id source) {
 static void set_application_icon_image(id application, SEL selector, id image) {
 	@autoreleasepool {
 		SetApplicationIconImageIMP original;
+		debug_log("setApplicationIconImage: called");
 		id resolved = load_custom_game_icon();
-		if (resolved == nil) resolved = normalized_game_icon(image);
+		if (resolved != nil) {
+			debug_log("using the custom icon");
+		} else {
+			resolved = normalized_game_icon(image);
+		}
 		pthread_mutex_lock(&icon_setter_lock);
 		original = original_set_application_icon_image;
 		pthread_mutex_unlock(&icon_setter_lock);
@@ -221,13 +262,14 @@ static void *wait_for_appkit(void *context) {
 	(void)context;
 	for (int attempt = 0; attempt < appkit_poll_limit; attempt++) {
 		@autoreleasepool {
-			if (install_icon_setter()) return NULL;
+			if (install_icon_setter()) {
+				debug_log("hook installed after %d polls", attempt);
+				return NULL;
+			}
 		}
 		nanosleep(&appkit_poll_interval, NULL);
 	}
-	if (debug_enabled) {
-		fprintf(stderr, "yaagl-squircle: timed out waiting for AppKit in %s\n", getprogname());
-	}
+	debug_log("timed out waiting for AppKit in %s", getprogname());
 	return NULL;
 }
 
@@ -245,9 +287,17 @@ __attribute__((constructor)) static void install_game_icon_bridge(void) {
 	if (!is_wine_client_process()) return;
 
 	debug_enabled = getenv("YAAGL_SQUIRCLE_DEBUG") != NULL;
-	if (debug_enabled) {
-		fprintf(stderr, "yaagl-squircle: bridge loaded in %s\n", getprogname());
+	const char *log_path = getenv("YAAGL_SQUIRCLE_LOG");
+	if (debug_enabled && log_path != NULL && log_path[0] != '\0') {
+		debug_log_path = strdup(log_path);
+		/* Several processes append to one file, so cap it by restarting it when large. */
+		struct stat info;
+		if (debug_log_path != NULL && stat(debug_log_path, &info) == 0 &&
+			info.st_size > 512 * 1024) {
+			truncate(debug_log_path, 0);
+		}
 	}
+	debug_log("bridge loaded in %s", getprogname());
 
 	const char *custom_path = getenv("YAAGL_SQUIRCLE_ICON");
 	if (custom_path != NULL && custom_path[0] != '\0') {
@@ -257,7 +307,7 @@ __attribute__((constructor)) static void install_game_icon_bridge(void) {
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, wait_for_appkit, NULL) == 0) {
 		pthread_detach(thread);
-	} else if (debug_enabled) {
-		fprintf(stderr, "yaagl-squircle: failed to start the bridge thread\n");
+	} else {
+		debug_log("failed to start the bridge thread");
 	}
 }

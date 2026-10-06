@@ -9,7 +9,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// The sh script that replaces the Wine loader and execs the renamed original.
-pub fn render(loader: &str, bridge: &Path, icon: Option<&Path>) -> String {
+pub fn render(loader: &str, bridge: &Path, icon: Option<&Path>, log: Option<&Path>) -> String {
     let mut s = format!(
         "#!/bin/sh\n# {MARKER} - managed file, remove with: yaagl-squircle revert\n\
          dir=$(dirname \"$0\")\n\
@@ -20,6 +20,12 @@ pub fn render(loader: &str, bridge: &Path, icon: Option<&Path>) -> String {
         s.push_str(&format!(
             "export YAAGL_SQUIRCLE_ICON={}\n",
             sh_quote(&icon.to_string_lossy())
+        ));
+    }
+    if let Some(log) = log {
+        s.push_str(&format!(
+            "export YAAGL_SQUIRCLE_DEBUG=1\nexport YAAGL_SQUIRCLE_LOG={}\n",
+            sh_quote(&log.to_string_lossy())
         ));
     }
     s.push_str(&format!("exec \"$dir/{loader}.real\" \"$@\"\n"));
@@ -44,7 +50,7 @@ mod tests {
 
     #[test]
     fn quotes_spaces_and_single_quotes() {
-        let s = render("wine64", Path::new("/a b/it's.dylib"), None);
+        let s = render("wine64", Path::new("/a b/it's.dylib"), None, None);
         assert!(s.contains(r"'/a b/it'\''s.dylib'"));
         assert!(s.contains("wine64.real"));
         assert!(!s.contains("YAAGL_SQUIRCLE_ICON"));
@@ -52,7 +58,25 @@ mod tests {
 
     #[test]
     fn icon_line_only_with_icon() {
-        let s = render("wine", Path::new("/b.dylib"), Some(Path::new("/i.png")));
+        let s = render(
+            "wine",
+            Path::new("/b.dylib"),
+            Some(Path::new("/i.png")),
+            None,
+        );
         assert!(s.contains("export YAAGL_SQUIRCLE_ICON='/i.png'"));
+        assert!(!s.contains("YAAGL_SQUIRCLE_DEBUG"));
+    }
+
+    #[test]
+    fn debug_lines_only_with_log() {
+        let s = render(
+            "wine",
+            Path::new("/b.dylib"),
+            None,
+            Some(Path::new("/l.log")),
+        );
+        assert!(s.contains("export YAAGL_SQUIRCLE_DEBUG=1"));
+        assert!(s.contains("export YAAGL_SQUIRCLE_LOG='/l.log'"));
     }
 }
