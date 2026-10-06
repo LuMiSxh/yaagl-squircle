@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+// The apply/revert tests only run on macOS, which leaves their helpers unused elsewhere.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,

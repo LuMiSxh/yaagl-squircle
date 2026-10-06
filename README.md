@@ -38,6 +38,6 @@ Include the output of `yaagl-squircle status --verbose` and `yaagl-squircle debu
 
 ## Build
 
-macOS with the Xcode Command Line Tools: `cargo build --release`. Other hosts can run `cargo check` and `cargo test` with an empty bridge stub.
+macOS with the Xcode Command Line Tools: `cargo build --release`. Linux can run `cargo check` and `cargo test` with an empty bridge stub; Windows is not supported.
 
 MPL-2.0.
