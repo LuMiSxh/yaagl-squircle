@@ -29,7 +29,7 @@ pub struct Args {
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
-    Ok,
+    Applied,
     NotPatched,
     Drifted,
     Wiped,
@@ -38,9 +38,10 @@ enum State {
 }
 
 impl State {
-    fn name(self) -> &'static str {
+    fn name(self, deep: bool) -> &'static str {
         match self {
-            State::Ok => "ok",
+            State::Applied if deep => "applied (deep)",
+            State::Applied => "applied",
             State::NotPatched => "not patched",
             State::Drifted => "drifted",
             State::Wiped => "wiped",
@@ -69,10 +70,33 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
     for bin in bins {
         let target = Target::from_bin(&bin);
         let (state, detail) = classify(&bin, target.as_ref(), &manifest, bridge_sha.as_deref());
-        all_ok &= state == State::Ok;
-        let mut row = json!({"dir": bin, "state": state.name(), "detail": detail});
+        all_ok &= state == State::Applied;
+        let deep = target.as_ref().is_some_and(|t| t.launcher.is_some());
+        let files: Vec<_> = target
+            .as_ref()
+            .map(Target::files)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(role, p)| {
+                json!({
+                    "role": role,
+                    "name": p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    "is": targets::describe(&p),
+                })
+            })
+            .collect();
+        let mut row = json!({
+            "dir": bin,
+            "label": target.as_ref().map(Target::label),
+            "layout": target.as_ref().map(Target::layout),
+            "deep": deep,
+            "state": state.name(deep),
+            "detail": detail,
+            "files": files,
+            "applied_at": manifest.entry(&bin).map(|e| e.applied_at.clone()),
+        });
         if args.verbose
-            && state == State::Ok
+            && state == State::Applied
             && let Some(t) = target.as_ref()
         {
             let smoke = probe::smoke_test(&t.loader_path());
@@ -85,15 +109,31 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
     out.emit(
         || {
             let mut s = render(&rows);
-            if manifest.debug {
-                s.push_str(&format!(
-                    "\ndebug: on, log {}",
-                    cmd_apply::log_path(&data).display()
-                ));
-            }
+            let bridge = cmd_apply::bridge_path(&data);
+            let bridge_state = match bridge_sha.as_deref() {
+                None => "missing",
+                Some(sha) if !BRIDGE.is_empty() && sha != sha256_hex(BRIDGE) => "outdated",
+                Some(_) => "present",
+            };
+            s.push_str(&format!("\n\nbridge  {bridge_state}  {}", bridge.display()));
+            s.push_str(&format!(
+                "\nicon    {}",
+                manifest.icon.as_deref().unwrap_or("clipped game icon")
+            ));
+            s.push_str(&if manifest.debug {
+                format!("\ndebug   on, log {}", cmd_apply::log_path(&data).display())
+            } else {
+                "\ndebug   off".to_owned()
+            });
             s
         },
-        json!({"bridge_embedded": !BRIDGE.is_empty(), "debug": manifest.debug, "targets": rows}),
+        json!({
+            "bridge_embedded": !BRIDGE.is_empty(),
+            "bridge_installed": bridge_sha.is_some(),
+            "icon": manifest.icon,
+            "debug": manifest.debug,
+            "targets": rows,
+        }),
     );
     Ok(if all_ok {
         Outcome::Done
@@ -106,13 +146,26 @@ fn render(rows: &[Value]) -> String {
     if rows.is_empty() {
         return "no YAAGL Wine install found\nhint: start YAAGL once so it downloads Wine".into();
     }
-    let mut lines = Vec::new();
+    let mut blocks = Vec::new();
     for r in rows {
-        lines.push(format!(
-            "{:<12} {}",
-            r["state"].as_str().unwrap_or(""),
-            r["dir"].as_str().unwrap_or("")
-        ));
+        let mut lines = Vec::new();
+        let label = r["label"].as_str().unwrap_or("");
+        lines.push(match r["layout"].as_str() {
+            Some(layout) => format!("{}: {label}  ({layout})", r["state"].as_str().unwrap_or("")),
+            None => format!("{}: {label}", r["state"].as_str().unwrap_or("")),
+        });
+        lines.push(format!("  {}", r["dir"].as_str().unwrap_or("")));
+        for f in r["files"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "    {:<10}{:<20}{}",
+                f["role"].as_str().unwrap_or(""),
+                f["name"].as_str().unwrap_or(""),
+                f["is"].as_str().unwrap_or("")
+            ));
+        }
+        if let Some(at) = r["applied_at"].as_str() {
+            lines.push(format!("    applied   {at}"));
+        }
         if let Some(d) = r["detail"].as_str().filter(|d| !d.is_empty()) {
             lines.push(format!("  {d}"));
         }
@@ -127,8 +180,9 @@ fn render(rows: &[Value]) -> String {
                 r["signing"].as_str().unwrap_or("").replace('\n', "\n  ")
             ));
         }
+        blocks.push(lines.join("\n"));
     }
-    lines.join("\n")
+    blocks.join("\n\n")
 }
 
 fn pass(v: &Value) -> &'static str {
@@ -179,19 +233,23 @@ fn classify(
                     "this CLI ships a newer bridge; run: yaagl-squircle apply".into(),
                 )
             } else {
-                (State::Ok, String::new())
+                (State::Applied, String::new())
             }
         }
         (false, true) => (
             State::Orphan,
             format!(
-                "{} exists without our wrapper; run: yaagl-squircle revert",
+                "{} exists without our wrapper and is left alone; if it is a leftover, reinstall Wine from YAAGL",
                 real.display()
             ),
         ),
         (false, false) if entry.is_some() => (
             State::Wiped,
             "Wine was replaced (normal after a YAAGL update); run: yaagl-squircle apply".into(),
+        ),
+        (false, false) if t.launcher.is_some() => (
+            State::NotPatched,
+            "a launcher script that is not ours sits in front of Wine; run: yaagl-squircle apply (it asks before patching the binary behind it)".into(),
         ),
         (false, false) => (State::NotPatched, "run: yaagl-squircle apply".into()),
     }

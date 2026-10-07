@@ -17,11 +17,17 @@ use tempfile::TempDir;
 const SCRIPT_WINE: &str = "#!/bin/sh\necho wine-test\n";
 const BINARY_WINE_SRC: &str =
     "#include <stdio.h>\nint main(void) { puts(\"wine-test\"); return 0; }\n";
+/// A launcher script shipped with some Wine builds: it drops DYLD_INSERT_LIBRARIES and
+/// execs the real loader, `wine.real`.
+const LAUNCHER_WINE: &str =
+    "#!/bin/sh\nunset DYLD_INSERT_LIBRARIES\nexec \"$(dirname \"$0\")/wine.real\" \"$@\"\n";
 
 enum Loader {
     /// A compiled Mach-O named like Wine's loader, so the real bridge loads into it.
     Binary,
     Script,
+    /// `wine` is a foreign launcher script in front of the Mach-O `wine.real`.
+    Launcher,
 }
 
 struct Env {
@@ -40,17 +46,12 @@ impl Env {
                 fs::write(bin.join("wine64"), SCRIPT_WINE).unwrap();
                 fs::set_permissions(bin.join("wine64"), fs::Permissions::from_mode(0o755)).unwrap();
             }
-            Loader::Binary => {
-                let src = dir.path().join("wine.c");
-                fs::write(&src, BINARY_WINE_SRC).unwrap();
-                let status = Command::new("xcrun")
-                    .args(["--sdk", "macosx", "clang"])
-                    .arg(&src)
-                    .arg("-o")
-                    .arg(bin.join("wine64"))
-                    .status()
-                    .unwrap();
-                assert!(status.success());
+            Loader::Binary => compile(dir.path(), &bin.join("wine64")),
+            Loader::Launcher => {
+                compile(dir.path(), &bin.join("wine.real"));
+                fs::write(bin.join("wine"), LAUNCHER_WINE).unwrap();
+                fs::set_permissions(bin.join("wine"), fs::Permissions::from_mode(0o755)).unwrap();
+                return Self { dir };
             }
         }
         fs::write(bin.join("wine64-preloader"), "preloader").unwrap();
@@ -73,6 +74,19 @@ impl Env {
             .output()
             .unwrap()
     }
+}
+
+fn compile(scratch: &Path, out: &Path) {
+    let src = scratch.join("wine.c");
+    fs::write(&src, BINARY_WINE_SRC).unwrap();
+    let status = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang"])
+        .arg(&src)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn code(o: &Output) -> i32 {
@@ -259,13 +273,62 @@ mod macos {
     }
 
     #[test]
-    fn apply_refuses_foreign_real_file_without_force() {
+    fn apply_never_overwrites_a_foreign_real_file() {
         let env = Env::new(Loader::Script);
         fs::write(env.bin().join("wine64.real"), "foreign").unwrap();
-        let o = env.run(&["apply"]);
-        assert_eq!(code(&o), 2);
-        assert!(stderr(&o).contains("--force"));
-        assert_eq!(read(&env.bin().join("wine64.real")), b"foreign");
+        for args in [&["apply"][..], &["apply", "--force"]] {
+            let o = env.run(args);
+            assert_eq!(code(&o), 2);
+            assert!(stderr(&o).contains("never overwritten"), "{}", stderr(&o));
+            assert_eq!(read(&env.bin().join("wine64.real")), b"foreign");
+        }
+    }
+
+    #[test]
+    fn launcher_script_is_kept_and_the_binary_behind_it_is_wrapped() {
+        let env = Env::new(Loader::Launcher);
+        let original = read(&env.bin().join("wine.real"));
+        let status = stdout(&env.run(&["status"]));
+        assert!(status.contains("not patched"), "{status}");
+        assert!(status.contains("launcher script (not ours)"), "{status}");
+
+        // Without a terminal to ask on, a deep patch needs --deep and changes nothing.
+        let refused = env.run(&["apply"]);
+        assert_eq!(code(&refused), 2);
+        assert!(stderr(&refused).contains("--deep"), "{}", stderr(&refused));
+        assert_eq!(read(&env.bin().join("wine.real")), original);
+        assert!(!env.bin().join("wine.real.real").exists());
+
+        let o = env.run(&["apply", "--deep"]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert!(stdout(&o).contains("patched (deep)"), "{}", stdout(&o));
+        assert!(stdout(&o).contains("rename"), "{}", stdout(&o));
+        assert_eq!(read(&env.bin().join("wine")), LAUNCHER_WINE.as_bytes());
+        assert_eq!(read(&env.bin().join("wine.real.real")), original);
+        let status = env.run(&["status"]);
+        assert_eq!(code(&status), 0);
+        assert!(
+            stdout(&status).contains("applied (deep)"),
+            "{}",
+            stdout(&status)
+        );
+
+        // The launcher unsets DYLD_INSERT_LIBRARIES; the wrapper behind it sets it again.
+        assert_eq!(code(&env.run(&["debug", "on"])), 0);
+        let run = Command::new(env.bin().join("wine"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(stdout(&run).trim(), "wine-test");
+        let log = fs::read_to_string(env.data().join("bridge.log")).unwrap();
+        assert!(log.contains("bridge loaded in wine.real.real"), "{log}");
+
+        let revert = env.run(&["revert"]);
+        assert_eq!(code(&revert), 0);
+        assert!(stdout(&revert).contains("untouched"), "{}", stdout(&revert));
+        assert_eq!(read(&env.bin().join("wine")), LAUNCHER_WINE.as_bytes());
+        assert_eq!(read(&env.bin().join("wine.real")), original);
+        assert!(!env.bin().join("wine.real.real").exists());
     }
 
     #[test]

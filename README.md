@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/LuMiSxh/yaagl-squircle/main/install
 
 ```sh
 yaagl-squircle apply     # patch, verify, roll back on failure
-yaagl-squircle status    # ok / not patched / drifted / wiped / orphan
+yaagl-squircle status    # each install: state, files and whose they are
 yaagl-squircle revert    # back to stock
 yaagl-squircle update    # new CLI, patches refreshed
 yaagl-squircle uninstall
@@ -23,6 +23,12 @@ yaagl-squircle uninstall
 Quit the game and YAAGL first. A Wine update inside YAAGL wipes the patch; `status` then shows `wiped`, and `apply` restores it.
 
 `apply --icon my.png` uses your own PNG instead of the clipped game icon. `--target <name|path>` selects a specific install.
+
+`apply`, `revert` and `status` list every install with its folder and each file they touched or found, so you can see what is ours and what is not.
+
+Some Wine builds put their own launcher script at `wine` that sets up the runtime and then runs `wine.real`. The script is never touched; instead `apply` asks before wrapping the binary behind it (`wine.real` moves to `wine.real.real`), and `status` shows that install as `applied (deep)`. Pass `--deep` to skip the question, e.g. in scripts. HSR-style installs with a plain `wine64` are patched as before.
+
+A `.real` file that is not ours is never overwritten, not even with `--force`; `--force` only re-verifies installs that are already current.
 
 Only YAAGL installs are touched: a folder counts only if it has `wine/bin`, `wine/lib/wine` and YAAGL's `resources.neu`. Wine installs of other launchers are ignored, even with `--target`.
 

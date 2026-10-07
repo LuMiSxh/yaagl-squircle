@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::{self, IsTerminal, Write},
     os::unix::fs::symlink,
     path::{Path, PathBuf},
 };
@@ -15,7 +16,7 @@ use crate::{
     manifest::{Entry, Manifest},
     probe,
     targets::{self, Target},
-    util::{Out, hinted, now_rfc3339, sha256_hex, write_atomic},
+    util::{Out, hinted, now_rfc3339, sha256_hex, step, write_atomic},
     wrapper,
 };
 
@@ -34,9 +35,12 @@ pub struct Args {
     /// Print the plan and change nothing.
     #[arg(long)]
     dry_run: bool,
-    /// Overwrite a foreign `.real` file, and re-verify targets that are already current.
+    /// Re-verify targets that are already current.
     #[arg(long)]
     force: bool,
+    /// Patch the Wine binary behind a foreign launcher script without asking.
+    #[arg(long)]
+    deep: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -44,6 +48,7 @@ enum Plan {
     Install,
     Refresh,
     Current,
+    Declined,
 }
 
 impl Plan {
@@ -52,6 +57,7 @@ impl Plan {
             Plan::Install => "patch",
             Plan::Refresh => "refresh",
             Plan::Current => "current",
+            Plan::Declined => "skip",
         }
     }
 }
@@ -72,6 +78,7 @@ pub fn refresh_args(targets: Vec<String>) -> Args {
         icon: None,
         dry_run: false,
         force: false,
+        deep: false,
     }
 }
 
@@ -115,7 +122,7 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
             icon_path.as_deref(),
             log_path.as_deref(),
         );
-        let mut plan = plan_for(t, &expected, bridge_ok && icon_src.is_none(), args.force)?;
+        let mut plan = plan_for(t, &expected, bridge_ok && icon_src.is_none())?;
         if plan == Plan::Current && args.force {
             plan = Plan::Refresh;
         }
@@ -125,13 +132,21 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
     if args.dry_run {
         let rows: Vec<_> = plans
             .iter()
-            .map(|(t, _, p)| json!({"dir": t.bin, "plan": p.verb()}))
+            .map(|(t, _, p)| json!({"dir": t.bin, "plan": p.verb(), "deep": t.launcher.is_some()}))
             .collect();
         out.emit(
             || {
                 plans
                     .iter()
-                    .map(|(t, _, p)| format!("would {}: {}", p.verb(), t.label()))
+                    .map(|(t, _, p)| {
+                        format!(
+                            "would {}: {}  ({})\n  {}",
+                            p.verb(),
+                            t.label(),
+                            t.layout(),
+                            t.bin.display()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             },
@@ -140,7 +155,16 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
         return Ok(Outcome::Done);
     }
     if plans.iter().all(|(_, _, p)| *p == Plan::Current) {
-        out.emit(|| "already current".into(), json!({"result": "current"}));
+        out.emit(
+            || {
+                let mut s = "already current".to_owned();
+                for (t, _, _) in &plans {
+                    s.push_str(&format!("\n  {}  ({})", t.label(), t.layout()));
+                }
+                s
+            },
+            json!({"result": "current"}),
+        );
         return Ok(Outcome::Nothing);
     }
     if let Some(name) = probe::running_wine() {
@@ -150,69 +174,162 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
         ));
     }
 
+    // A first deep patch goes into a file another tool owns: ask before anything changes.
+    for (t, _, plan) in &mut plans {
+        if *plan == Plan::Install && t.launcher.is_some() && !confirm_deep(t, args.deep)? {
+            *plan = Plan::Declined;
+        }
+    }
+
+    let mut setup = Vec::new();
     fs::create_dir_all(&data)?;
     if !bridge_ok {
         write_atomic(&bridge_path, BRIDGE, 0o755)?;
+        step(
+            &mut setup,
+            "bridge",
+            format!("wrote {}", bridge_path.display()),
+        );
     }
     if let Some(src) = &icon_src {
         write_atomic(&data.join(ICON_FILE), &fs::read(src)?, 0o644)?;
         manifest.icon = Some(data.join(ICON_FILE).to_string_lossy().into_owned());
+        step(
+            &mut setup,
+            "icon",
+            format!(
+                "copied {} -> {}",
+                src.display(),
+                data.join(ICON_FILE).display()
+            ),
+        );
     }
 
     let mut results = Vec::new();
     let mut first_error = None;
     for (t, expected, plan) in plans {
-        if plan == Plan::Current {
-            results.push(json!({"dir": t.bin, "result": "current"}));
-            continue;
-        }
-        match apply_one(t, &expected, plan) {
-            Ok(()) => {
-                manifest.cli_version = env!("CARGO_PKG_VERSION").into();
-                manifest.bridge_sha256 = bridge_sha.clone();
-                manifest.upsert(Entry {
-                    dir: t.bin.clone(),
-                    loader: t.loader.into(),
-                    real: format!("{}.real", t.loader),
-                    wrapper_sha256: sha256_hex(expected.as_bytes()),
-                    applied_at: now_rfc3339(),
-                });
-                manifest.save(&data)?;
-                results.push(json!({"dir": t.bin, "result": "patched"}));
+        let mut steps = Vec::new();
+        let result = match plan {
+            Plan::Current => {
+                step(
+                    &mut steps,
+                    "nothing",
+                    "wrapper, bridge and icon are current",
+                );
+                "current"
             }
-            Err(e) => {
-                results.push(json!({"dir": t.bin, "result": "failed", "error": format!("{e:#}")}));
-                if first_error.is_none() {
-                    first_error = Some(e);
-                } else {
-                    eprintln!("error: {}: {e:#}", t.label());
+            Plan::Declined => {
+                step(&mut steps, "nothing", "declined; no file was changed");
+                "skipped"
+            }
+            Plan::Install | Plan::Refresh => match apply_one(t, &expected, plan, &mut steps) {
+                Ok(()) => {
+                    manifest.cli_version = env!("CARGO_PKG_VERSION").into();
+                    manifest.bridge_sha256 = bridge_sha.clone();
+                    manifest.upsert(Entry {
+                        dir: t.bin.clone(),
+                        loader: t.loader.into(),
+                        real: format!("{}.real", t.loader),
+                        wrapper_sha256: sha256_hex(expected.as_bytes()),
+                        applied_at: now_rfc3339(),
+                    });
+                    manifest.save(&data)?;
+                    if t.launcher.is_some() {
+                        "patched (deep)"
+                    } else {
+                        "patched"
+                    }
                 }
-            }
-        }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    } else {
+                        eprintln!("error: {}: {e:#}", t.label());
+                    }
+                    "failed"
+                }
+            },
+        };
+        results.push(json!({
+            "dir": t.bin,
+            "label": t.label(),
+            "layout": t.layout(),
+            "deep": t.launcher.is_some(),
+            "result": result,
+            "steps": steps,
+        }));
     }
     out.emit(
         || {
-            results
-                .iter()
-                .map(|r| {
-                    format!(
-                        "{}: {}",
-                        r["result"].as_str().unwrap_or(""),
-                        r["dir"].as_str().unwrap_or("")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut blocks: Vec<String> = Vec::new();
+            if !setup.is_empty() {
+                blocks.push(setup.join("\n"));
+            }
+            blocks.extend(results.iter().map(render_row));
+            blocks.join("\n\n")
         },
-        json!({"targets": results}),
+        json!({"setup": setup, "targets": results}),
     );
+    let changed = results.iter().any(|r| {
+        r["result"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("patched"))
+    });
     match first_error {
         Some(e) => Err(e),
-        None => Ok(Outcome::Done),
+        None if changed => Ok(Outcome::Done),
+        None => Ok(Outcome::Nothing),
     }
 }
 
-fn plan_for(t: &Target, expected: &str, bridge_ok: bool, force: bool) -> Result<Plan> {
+/// One target as a block: result and name, its folder, then the steps taken.
+pub fn render_row(r: &serde_json::Value) -> String {
+    let mut s = format!(
+        "{}: {}  ({})\n  {}",
+        r["result"].as_str().unwrap_or(""),
+        r["label"].as_str().unwrap_or(""),
+        r["layout"].as_str().unwrap_or(""),
+        r["dir"].as_str().unwrap_or("")
+    );
+    for line in r["steps"].as_array().into_iter().flatten() {
+        s.push_str(&format!("\n    {}", line.as_str().unwrap_or("")));
+    }
+    s
+}
+
+fn confirm_deep(t: &Target, yes: bool) -> Result<bool> {
+    let launcher = t.launcher.unwrap_or("wine");
+    if yes {
+        return Ok(true);
+    }
+    if !io::stdin().is_terminal() {
+        return Err(hinted(
+            format!(
+                "{}: `{launcher}` is a launcher script that is not ours",
+                t.label()
+            ),
+            format!(
+                "pass --deep to patch the Wine binary behind it (`{}`), or leave this folder out with --target",
+                t.loader
+            ),
+        ));
+    }
+    eprint!(
+        "{label}: `{launcher}` is a launcher script that is not ours.\n\
+         Wrapping it would not keep the bridge loaded, so the Wine binary behind it\n\
+         would be patched instead: `{loader}` is renamed to `{loader}.real` and our\n\
+         wrapper takes its place. `{launcher}` itself stays untouched.\n\
+         Patch `{loader}`? [y/N] ",
+        label = t.label(),
+        loader = t.loader,
+    );
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+fn plan_for(t: &Target, expected: &str, bridge_ok: bool) -> Result<Plan> {
     let (loader, real) = (t.loader_path(), t.real_path());
     if loader.exists() && wrapper::is_wrapper(&loader) {
         if !real.exists() {
@@ -239,44 +356,76 @@ fn plan_for(t: &Target, expected: &str, bridge_ok: bool, force: bool) -> Result<
             "the original loader is gone; reinstall Wine from YAAGL",
         ));
     }
-    if real.exists() && !force {
+    if real.exists() {
         return Err(hinted(
             format!(
                 "{} already exists but {} is not our wrapper",
                 real.display(),
                 loader.display()
             ),
-            "inspect both files; pass --force to overwrite the .real file",
+            "that file is not ours, so it is never overwritten; if it is a leftover, reinstall Wine from YAAGL",
         ));
     }
     Ok(Plan::Install)
 }
 
-fn apply_one(t: &Target, expected: &str, plan: Plan) -> Result<()> {
+fn apply_one(t: &Target, expected: &str, plan: Plan, steps: &mut Vec<String>) -> Result<()> {
     let (loader, real) = (t.loader_path(), t.real_path());
     let undo = if plan == Plan::Install {
         fs::rename(&loader, &real)
             .with_context(|| format!("cannot rename {}", loader.display()))?;
+        step(
+            steps,
+            "rename",
+            format!("{} -> {}.real", t.loader, t.loader),
+        );
         Undo::Swapped
     } else {
+        step(steps, "keep", format!("{}.real (original)", t.loader));
         Undo::Restore(fs::read(&loader)?)
     };
 
     let mut link_created = false;
     let outcome = (|| -> Result<()> {
         write_atomic(&loader, expected.as_bytes(), 0o755)?;
+        step(steps, "write", format!("{} (our wrapper)", t.loader));
         link_created = ensure_preloader_link(t)?;
-        verify(t)
+        if link_created {
+            step(
+                steps,
+                "link",
+                format!("{}.real-preloader -> {}-preloader", t.loader, t.loader),
+            );
+        }
+        let version = verify(t)?;
+        step(steps, "verify", format!("{version}, bridge loaded"));
+        Ok(())
     })();
 
     if outcome.is_err() {
+        step(steps, "verify", "FAILED, undoing");
         // Best effort: the original error is what the user needs to see.
-        let _ = match undo {
-            Undo::Swapped => fs::rename(&real, &loader).map_err(anyhow::Error::from),
-            Undo::Restore(old) => write_atomic(&loader, &old, 0o755),
+        let (undone, what) = match undo {
+            Undo::Swapped => (
+                fs::rename(&real, &loader).map_err(anyhow::Error::from),
+                format!("{}.real -> {}", t.loader, t.loader),
+            ),
+            Undo::Restore(old) => (
+                write_atomic(&loader, &old, 0o755),
+                format!("{} (previous wrapper)", t.loader),
+            ),
         };
+        match undone {
+            Ok(()) => step(steps, "undo", what),
+            Err(e) => step(steps, "undo", format!("FAILED to restore {what}: {e:#}")),
+        }
         if link_created {
             let _ = fs::remove_file(t.preloader_link());
+            step(
+                steps,
+                "undo",
+                format!("removed {}.real-preloader", t.loader),
+            );
         }
     }
     outcome
@@ -294,7 +443,8 @@ fn ensure_preloader_link(t: &Target) -> Result<bool> {
     Ok(true)
 }
 
-fn verify(t: &Target) -> Result<()> {
+/// Returns the version line Wine printed.
+fn verify(t: &Target) -> Result<String> {
     let smoke = probe::smoke_test(&t.loader_path());
     if !smoke.version_ok {
         return Err(hinted(
@@ -314,5 +464,5 @@ fn verify(t: &Target) -> Result<()> {
             ),
         ));
     }
-    Ok(())
+    Ok(smoke.output.lines().next().unwrap_or("").to_owned())
 }

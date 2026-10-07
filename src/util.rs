@@ -52,6 +52,11 @@ impl Out {
     }
 }
 
+/// Records one action of a command as an aligned `verb  detail` line.
+pub fn step(steps: &mut Vec<String>, verb: &str, detail: impl AsRef<str>) {
+    steps.push(format!("{verb:<8} {}", detail.as_ref()));
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()

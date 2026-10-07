@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
 use anyhow::Result;
 
-use crate::util::hinted;
+use crate::{util::hinted, wrapper};
 
 /// An installed Wine `bin` folder inside a YAAGL data directory.
 #[derive(Clone)]
 pub struct Target {
     pub bin: PathBuf,
     pub loader: &'static str,
+    /// A foreign launcher script in front of `loader` (a "deep" patch), e.g. `wine`.
+    pub launcher: Option<&'static str>,
 }
 
 impl Target {
@@ -25,13 +27,27 @@ impl Target {
         if !bin.join("../lib/wine").is_dir() || !bin.join("../../resources.neu").is_file() {
             return None;
         }
-        ["wine64", "wine"]
+        let name = ["wine64", "wine"]
             .into_iter()
-            .find(|l| bin.join(l).exists() || bin.join(format!("{l}.real")).exists())
-            .map(|loader| Self {
-                bin: bin.to_path_buf(),
-                loader,
-            })
+            .find(|l| bin.join(l).exists() || bin.join(format!("{l}.real")).exists())?;
+        // Some builds ship their own launcher script at `wine` that sets up the runtime,
+        // unsets DYLD_INSERT_LIBRARIES and execs `wine.real`. Wrapping that script would
+        // lose the bridge, so the binary behind it is the loader we wrap instead.
+        let inner = bin.join(format!("{name}.real"));
+        let deep = is_foreign_script(&bin.join(name))
+            && (is_macho(&inner)
+                || wrapper::is_wrapper(&inner)
+                || bin.join(format!("{name}.real.real")).exists());
+        let (loader, launcher) = match (deep, name) {
+            (false, _) => (name, None),
+            (true, "wine64") => ("wine64.real", Some(name)),
+            (true, _) => ("wine.real", Some(name)),
+        };
+        Some(Self {
+            bin: bin.to_path_buf(),
+            loader,
+            launcher,
+        })
     }
 
     pub fn loader_path(&self) -> PathBuf {
@@ -50,6 +66,39 @@ impl Target {
         self.bin.join(format!("{}.real-preloader", self.loader))
     }
 
+    /// The relevant files in `wine/bin` with their role, for status output.
+    pub fn files(&self) -> Vec<(&'static str, PathBuf)> {
+        let mut files = Vec::new();
+        if let Some(l) = self.launcher {
+            files.push(("launcher", self.bin.join(l)));
+        }
+        files.push(("loader", self.loader_path()));
+        // A missing original only matters once our wrapper depends on it.
+        if self.real_path().exists() || wrapper::is_wrapper(&self.loader_path()) {
+            files.push(("original", self.real_path()));
+        }
+        for (role, p) in [
+            ("preloader", self.preloader_src()),
+            ("link", self.preloader_link()),
+        ] {
+            if p.symlink_metadata().is_ok() {
+                files.push((role, p));
+            }
+        }
+        files
+    }
+
+    /// "deep" when the patch sits behind a foreign launcher script.
+    pub fn layout(&self) -> String {
+        match self.launcher {
+            Some(l) => format!(
+                "deep: launcher script `{l}` (not ours) -> `{}`",
+                self.loader
+            ),
+            None => format!("loader `{}`", self.loader),
+        }
+    }
+
     /// The YAAGL folder name, e.g. `Yaagl OS`.
     pub fn label(&self) -> String {
         self.bin
@@ -60,6 +109,39 @@ impl Target {
                 || self.bin.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             )
+    }
+}
+
+fn head4(path: &Path) -> [u8; 4] {
+    let mut head = [0u8; 4];
+    let _ = fs::File::open(path).and_then(|mut f| io::Read::read_exact(&mut f, &mut head));
+    head
+}
+
+/// A shell script that is not our wrapper, i.e. a launcher script shipped with Wine.
+fn is_foreign_script(path: &Path) -> bool {
+    head4(path).starts_with(b"#!") && !wrapper::is_wrapper(path)
+}
+
+fn is_macho(path: &Path) -> bool {
+    matches!(
+        head4(path),
+        [0xcf, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
+    )
+}
+
+/// What a file in `wine/bin` is, for showing the user what is installed.
+pub fn describe(path: &Path) -> String {
+    match fs::symlink_metadata(path) {
+        Err(_) => "missing".into(),
+        Ok(m) if m.is_symlink() => match fs::read_link(path) {
+            Ok(dest) => format!("symlink -> {}", dest.display()),
+            Err(_) => "symlink".into(),
+        },
+        Ok(_) if wrapper::is_wrapper(path) => "our wrapper".into(),
+        Ok(_) if is_macho(path) => "Wine binary (Mach-O)".into(),
+        Ok(_) if is_foreign_script(path) => "launcher script (not ours)".into(),
+        Ok(_) => "unknown file (not ours)".into(),
     }
 }
 

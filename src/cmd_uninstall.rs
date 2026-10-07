@@ -44,9 +44,9 @@ pub fn run(args: Args, out: &Out) -> Result<Outcome> {
     let mut manifest = Manifest::load(&data)?;
     let bins = cmd_revert::all_bins(&support, &manifest);
     let rows = cmd_revert::revert_all(&bins, &mut manifest)?;
-    if let Some((dir, _)) = rows.iter().find(|(_, r)| *r == "kept") {
+    if let Some(row) = rows.iter().find(|r| r["result"] == "kept") {
         return Err(hinted(
-            format!("could not restore {}", dir.display()),
+            format!("could not restore {}", row["dir"].as_str().unwrap_or("")),
             "fix or reinstall that Wine folder, then run uninstall again; nothing was deleted",
         ));
     }
